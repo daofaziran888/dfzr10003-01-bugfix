@@ -1,65 +1,70 @@
-"""明细层清洗接口：维护清洗流水，覆盖启动清洗、暂停清洗、归档流水等动作。"""
-from __future__ import annotations
+"""明细层清洗接口：展示由贴源层接入状态实时派生的清洗准入清单。
 
-from typing import Any
+准入结论不在本模块单独维护，统一调用共享状态引擎，保证与贴源层列表、
+导出读到同一条合法状态结论；已归档流水不会出现在队列中。
+"""
+from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.schemas import ActionResult, EntryPayload, PageResult
+from app.routers.export_utils import DWD_EXPORT_COLUMNS, csv_response
+from app.schemas import PageResult
 from app.services.dwd import DwdService
 
 router = APIRouter(prefix="/api/dwd", tags=["明细层清洗"])
 
 service = DwdService()
 
-LIST_FIELDS = ["流水编号", "输入表名", "输出表名", "空值填充", "格式转换", "脏数据比例", "执行批次", "清洗状态"]
+LIST_FIELDS = ["流水编号", "输入表名", "输出表名", "接入状态", "分区水位", "执行批次", "可准入", "准入结论"]
 STATUSES = ["草稿", "运行中", "已暂停", "已完成"]
+ADMISSION_OPTIONS = ["可准入", "不可准入"]
 
 
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按流水编号检索"),
     status: str | None = Query(default=None, description="草稿、运行中、已暂停、已完成"),
+    admission: str | None = Query(default=None, description="可准入、不可准入"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按流水编号与状态过滤明细层清洗列表；没有数据时返回空页，不报错。"""
+    """读取清洗准入清单；没有数据时返回空页，不报错。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"状态「{status}」不合法，可选：{'、'.join(STATUSES)}")
+    if admission and admission not in ADMISSION_OPTIONS:
+        raise HTTPException(
+            status_code=400, detail=f"准入条件「{admission}」不合法，可选：{'、'.join(ADMISSION_OPTIONS)}"
+        )
+    items, total = service.list_entries(
+        keyword=keyword, status=status, admission=admission, page=page, size=size
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+# 导出路由必须排在 /{entry_id} 动态路由之前，避免被整数路径参数截获
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按流水编号检索"),
+    status: str | None = Query(default=None, description="草稿、运行中、已暂停、已完成"),
+    admission: str | None = Query(default=None, description="可准入、不可准入"),
+):
+    """导出清洗准入清单 CSV，与页面当次可见的准入结论完全一致。"""
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"状态「{status}」不合法，可选：{'、'.join(STATUSES)}")
+    if admission and admission not in ADMISSION_OPTIONS:
+        raise HTTPException(
+            status_code=400, detail=f"准入条件「{admission}」不合法，可选：{'、'.join(ADMISSION_OPTIONS)}"
+        )
+    items = service.list_all_for_export(keyword=keyword, status=status, admission=admission)
+    return csv_response(items, filename="dwd_admission_entries.csv", columns=DWD_EXPORT_COLUMNS)
 
 
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
-    """读取单条清洗流水明细；不存在时给出可读的错误说明。"""
+    """读取单条清洗准入明细；已归档流水不在队列中，按不存在处理。"""
     entry = service.get_entry(entry_id)
     if entry is None:
-        raise HTTPException(status_code=404, detail=f"清洗流水 {entry_id} 不存在或已归档")
+        raise HTTPException(status_code=404, detail=f"清洗准入记录 {entry_id} 不存在或对应流水已归档")
     return entry
-
-
-@router.post("", response_model=ActionResult)
-def create_entry(payload: EntryPayload) -> ActionResult:
-    """登记一条清洗流水，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
-    return ActionResult(ok=True, message="清洗流水已登记", entry=entry)
-
-
-@router.post("/{entry_id}/actions", response_model=ActionResult)
-def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条清洗流水执行启动清洗、暂停清洗、归档流水；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
-    if entry is None:
-        return ActionResult(ok=False, message=message)
-    return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出明细层清洗清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "dwd", "total": total, "items": items}

@@ -1,15 +1,14 @@
-"""明细层清洗业务规则：状态流转、字段校验与筛选口径都收在这里。"""
+"""明细层清洗业务规则：清洗准入清单直接由贴源层接入流水派生。
+
+本模块不再维护独立于接入的第二份状态——接入状态是唯一事实来源，
+两个入口通过 :mod:`app.services.flow_state` 得到同一条合法状态结论。
+已归档的接入流水不会再出现在待清洗队列中。
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from app.store import store
-
-MODULE = "dwd"
-REQUIRED_FIELDS = ["流水编号", "输入表名", "输出表名"]
-STATUS_ORDER = ["草稿", "运行中", "已暂停", "已完成"]
-ACTION_RULES = {"启动清洗": "草稿", "暂停清洗": "运行中", "归档流水": "已暂停"}
-NEGATIVE_ACTIONS = []
+from app.services import flow_state
 
 
 class DwdService:
@@ -18,44 +17,31 @@ class DwdService:
         *,
         keyword: str | None = None,
         status: str | None = None,
+        admission: str | None = None,
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = store.rows(MODULE)
-        if keyword:
-            rows = [row for row in rows if keyword in str(row.get("流水编号", ""))]
-        if status:
-            rows = [row for row in rows if row.get("status") == status]
+        rows = flow_state.admission_queue(
+            keyword=keyword, status=status, admission=admission
+        )
         total = len(rows)
         start = max(page - 1, 0) * size
         return rows[start:start + size], total
 
+    def list_all_for_export(
+        self,
+        *,
+        keyword: str | None = None,
+        status: str | None = None,
+        admission: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """导出与清洗页列表同口径，确保每条流水的准入结论完全一致。"""
+        return flow_state.admission_queue(
+            keyword=keyword, status=status, admission=admission
+        )
+
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return store.find(MODULE, entry_id)
-
-    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-        missing = [field for field in REQUIRED_FIELDS if not str(values.get(field) or "").strip()]
-        if missing:
-            return None, missing
-        rows = store.rows(MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
-        entry.update({field: values.get(field) for field in REQUIRED_FIELDS})
-        entry["status"] = STATUS_ORDER[0]
-        entry["pending"] = True
-        entry["abnormal"] = False
-        rows.append(entry)
-        return entry, []
-
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry = store.find(MODULE, entry_id)
-        if entry is None:
-            return None, f"清洗流水 {entry_id} 不存在或已归档"
-        if action not in ACTION_RULES:
-            return None, f"动作「{action}」不属于明细层清洗可执行范围"
-        target = ACTION_RULES[action]
-        if target not in STATUS_ORDER:
-            return None, f"目标状态「{target}」不在允许的状态序列里"
-        entry["status"] = target
-        entry["pending"] = target != STATUS_ORDER[-1]
-        entry["abnormal"] = action in NEGATIVE_ACTIONS
-        return entry, f"清洗流水已{action}"
+        for row in flow_state.admission_queue():
+            if int(row.get("id", 0)) == entry_id:
+                return row
+        return None

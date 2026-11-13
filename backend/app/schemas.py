@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 T = TypeVar("T")
 
@@ -26,6 +26,27 @@ class EntryPayload(BaseModel):
 
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
+
+
+class ActionPayload(BaseModel):
+    """动作请求体：同时兼容前端扁平结构与 values 嵌套结构。
+
+    前端历史上直接发送 ``{"action": "暂停接入"}``，旧模型只读 ``values``
+    会把动作解析成空串并误报成功；这里两种写法都能正确取到动作。
+    """
+
+    action: str | None = None
+    expected_version: int | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    remark: str | None = None
+
+    @model_validator(mode="after")
+    def _fill_from_values(self) -> "ActionPayload":
+        if not self.action and self.values.get("action"):
+            self.action = str(self.values["action"])
+        if self.expected_version is None and self.values.get("expected_version") is not None:
+            self.expected_version = int(self.values["expected_version"])
+        return self
 
 
 

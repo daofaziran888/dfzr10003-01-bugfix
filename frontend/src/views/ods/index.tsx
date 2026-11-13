@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { request } from '@/api/client'
+import { downloadFile, request } from '@/api/client'
 
 const ENDPOINT = '/api/ods'
 const columns = [
@@ -11,12 +11,11 @@ const columns = [
   "接入周期",
   "分区粒度",
   "保留天数",
-  "最近接入时间"
-]
-const actions = [
-  "启动接入",
-  "暂停接入",
-  "归档流水"
+  "最近接入时间",
+  "接入状态",
+  "分区水位",
+  "可准入",
+  "准入结论"
 ]
 const statuses = [
   "草稿",
@@ -24,6 +23,13 @@ const statuses = [
   "已暂停",
   "已完成"
 ]
+// 与后端状态机 NEXT_ACTIONS 保持一致：页面只暴露合法动作，非法跳级在前端即收起
+const nextActions: Record<string, string[]> = {
+  "草稿": ["启动接入"],
+  "运行中": ["暂停接入", "完成接入"],
+  "已暂停": ["启动接入", "归档流水"],
+  "已完成": ["归档流水"]
+}
 const stats = [
   {
     "label": "接入流水总数",
@@ -39,20 +45,21 @@ const stats = [
   }
 ]
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, string | number | boolean | null>
 
 export default function OdsView() {
   const [rows, setRows] = useState<Row[]>([])
   const [total, setTotal] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
-  const [filters, setFilters] = useState<Record<string, string>>({})
-  const filterFields = useMemo(() => columns.slice(0, 3), [])
+  const [filters, setFilters] = useState<{ keyword: string; status: string }>({ keyword: '', status: '' })
 
   const reload = useCallback(async () => {
     setErrorMessage('')
-    const query = new URLSearchParams(filters).toString()
+    const params = new URLSearchParams()
+    if (filters.keyword.trim()) params.set('keyword', filters.keyword.trim())
+    if (filters.status) params.set('status', filters.status)
     try {
-      const response = await request(`${ENDPOINT}?${query}`)
+      const response = await request(`${ENDPOINT}?${params.toString()}`)
       if (!response.ok) {
         throw new Error('接入流水列表读取失败')
       }
@@ -73,10 +80,12 @@ export default function OdsView() {
     try {
       const response = await request(`${ENDPOINT}/${row.id}/actions`, {
         method: 'POST',
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, expected_version: row.version }),
       })
-      if (!response.ok) {
-        throw new Error('贴源层接入动作未生效，请稍后重试')
+      const payload = await response.json()
+      if (!response.ok || payload.ok === false) {
+        // 409 版本冲突或业务非法流转都把后端说明展示给值班同事
+        throw new Error(payload.detail ?? payload.message ?? '贴源层接入动作未生效')
       }
       await reload()
     } catch (error) {
@@ -84,18 +93,32 @@ export default function OdsView() {
     }
   }
 
+  const handleExport = useCallback(async () => {
+    setErrorMessage('')
+    const params = new URLSearchParams()
+    if (filters.keyword.trim()) params.set('keyword', filters.keyword.trim())
+    if (filters.status) params.set('status', filters.status)
+    try {
+      await downloadFile(`${ENDPOINT}/export?${params.toString()}`, 'ods_access_entries.csv')
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '贴源层接入清单导出失败')
+    }
+  }, [filters])
+
+  const filterFields = useMemo(() => ["流水编号"], [])
+
   return (
     <section className="page" data-module="ods">
       <header className="page-head">
         <div>
           <h2>贴源层接入管理</h2>
-          <p className="page-desc">维护贴源层接入流水的配置、执行状态与落地记录，为原始数据接入提供可追踪的数据工程流程。</p>
+          <p className="page-desc">维护贴源层接入流水的配置、执行状态与落地记录，状态按草稿→运行中→已暂停→已完成单向推进，为明细清洗提供统一准入结论。</p>
         </div>
         <div className="page-actions">
           <button className="btn primary" type="button" onClick={() => setErrorMessage('接入流水登记入口尚未接入审批流')}>
             登记接入流水
           </button>
-          <button className="btn" type="button" onClick={() => window.open(`${ENDPOINT}/export`, '_blank')}>
+          <button className="btn" type="button" onClick={() => void handleExport()}>
             导出贴源层接入清单
           </button>
         </div>
@@ -115,14 +138,24 @@ export default function OdsView() {
           <label key={field} className="filter-item">
             <span>{field}</span>
             <input
-              value={filters[field] ?? ''}
+              value={filters.keyword}
               placeholder={`按${field}检索`}
-              onChange={(event) => setFilters((prev) => ({ ...prev, [field]: event.target.value }))}
+              onChange={(event) => setFilters((prev) => ({ ...prev, keyword: event.target.value }))}
             />
           </label>
         ))}
+        <label className="filter-item">
+          <span>接入状态</span>
+          <select
+            value={filters.status}
+            onChange={(event) => setFilters((prev) => ({ ...prev, status: event.target.value }))}
+          >
+            <option value="">全部状态</option>
+            {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
+          </select>
+        </label>
         <button className="btn" type="submit">查询</button>
-        <button className="btn ghost" type="button" onClick={() => setFilters({})}>重置条件</button>
+        <button className="btn ghost" type="button" onClick={() => setFilters({ keyword: '', status: '' })}>重置条件</button>
       </form>
 
       <table className="data-table">
@@ -133,18 +166,35 @@ export default function OdsView() {
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={String(row.id)}>
-              {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
-              <td className="row-actions">
-                {actions.map((action) => (
-                  <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
-                    {action}
-                  </button>
+          {rows.map((row) => {
+            const archived = row.归档标记 === '是'
+            const legalActions = archived ? [] : (nextActions[String(row.status)] ?? [])
+            return (
+              <tr key={String(row.id)} className={archived ? 'row-archived' : ''}>
+                {columns.map((column) => (
+                  <td key={column}>
+                    {column === '接入状态' ? (
+                      <span className={`status-badge status-${String(row.status)}`}>{String(row.status ?? '—')}</span>
+                    ) : column === '可准入' ? (
+                      <span className={`admission-badge admission-${row[column] === '是' ? 'yes' : 'no'}`}>
+                        {String(row[column] ?? '—')}
+                      </span>
+                    ) : (
+                      String(row[column] ?? '—')
+                    )}
+                  </td>
                 ))}
-              </td>
-            </tr>
-          ))}
+                <td className="row-actions">
+                  {legalActions.length === 0 && <span className="muted-text">—</span>}
+                  {legalActions.map((action) => (
+                    <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
+                      {action}
+                    </button>
+                  ))}
+                </td>
+              </tr>
+            )
+          })}
           {rows.length === 0 && (
             <tr>
               <td className="empty-state" colSpan={columns.length + 1}>暂无贴源层接入数据，可先登记接入流水</td>

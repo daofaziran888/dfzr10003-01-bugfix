@@ -19,3 +19,23 @@ export async function fetchJson<T>(path: string): Promise<T> {
   }
   return (await response.json()) as T
 }
+
+/** 以浏览器下载方式获取导出文件：拿到 Blob 后触发另存，支持网页直接下载。 */
+export async function downloadFile(path: string, fallbackName: string): Promise<void> {
+  const response = await request(path)
+  if (!response.ok) {
+    throw new Error(`导出失败：接口返回 ${response.status}`)
+  }
+  const blob = await response.blob()
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const matched = /filename="?([^"]+)"?/.exec(disposition)
+  const filename = matched?.[1] ? decodeURIComponent(matched[1]) : fallbackName
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
